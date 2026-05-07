@@ -2484,7 +2484,21 @@ void jl_get_llvmf_defn_impl(jl_llvmf_dump_t *dump, jl_method_instance_t *mi, jl_
                         parseLLVMOptions(llvm_options, print_opts);
                         print_opts.out = &pass_output_stream;
                     }
-                    NewPM PM{jl_ExecutionEngine->cloneTargetMachine(), getOptLevel(jl_options.opt_level), opts, print_opts};
+                    // Use per-function optimization level if set, otherwise fall back to global
+                    int fn_optlevel = jl_options.opt_level;
+                    for (auto &F : output.get_module()) {
+                        if (!F.isDeclaration()) {
+                            Attribute attr = F.getFnAttribute("julia-optimization-level");
+                            StringRef val = attr.getValueAsString();
+                            if (val != "") {
+                                int ol = (int)val[0] - '0';
+                                if (ol >= 0 && ol <= 3)
+                                    fn_optlevel = ol;
+                                break;
+                            }
+                        }
+                    }
+                    NewPM PM{jl_ExecutionEngine->cloneTargetMachine(), getOptLevel(fn_optlevel), opts, print_opts};
                     //Safe b/c context lock is held by output
                     PM.run(output.get_module());
                     assert(!verifyLLVMIR(output.get_module()));

@@ -560,6 +560,8 @@ function est_to_dst(st::SyntaxTree)
         ([K"meta" [K"unknown_head" ps...]], when=st[1].name_val === "purity") ->
             @ast g st [K"meta" "purity"::K"Symbol"
                 Base.EffectsOverride([x.value for x in ps]...)::K"Value"]
+        ([K"meta" [K"unknown_head" v]], when=st[1].name_val in ("optlevel", "compile", "infer", "max_methods")) ->
+            @ast g st [K"meta" st[1].name_val::K"Symbol" v]
         ([K"meta" s vs...],
          when=(meta=get(s, :name_val, "")::String; meta in ("nospecialize", "specialize"))) ->
              # Should be handled in the function case
