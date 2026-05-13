@@ -690,6 +690,17 @@ extern "C" int jl_test_cpu_feature(jl_cpu_feature_t feature)
     return feature_test(&host_feats, feature);
 }
 
+// Test whether the host CPU supports a feature by its cpufeatures name.
+// Returns false for feature names not in the host arch's cpufeatures table.
+// Used by jl_cpu_supports (the runtime fallback for Core.Intrinsics.cpu_supports).
+extern "C" JL_DLLEXPORT int jl_host_cpu_supports(const char *feature_name)
+{
+    if (!feature_name || !*feature_name)
+        return 0;
+    auto host_feats = tp::get_host_features();
+    return tp::has_feature(host_feats, feature_name);
+}
+
 // ============================================================================
 // Cross-architecture CPU/feature queries
 // ============================================================================
@@ -713,6 +724,31 @@ extern "C" JL_DLLEXPORT int jl_cpufeatures_lookup(const char *cpu_name,
         hw.bits[i] = entry->features.bits[i] & hw_feature_mask.bits[i];
     memcpy(features_out, &hw, sizeof(FeatureBits));
     return 0;
+}
+
+// Expand a uarch (LLVM CPU name) into the comma-separated list of LLVM
+// feature names a sysimg / JIT clone targeting that CPU would actually have.
+// Routes through tp::resolve_targets_for_llvm so the answer is identical to
+// what multiversioning produces: hw-masked and with non-deterministic
+// features (rdrnd, rdseed, xsaveopt on x86) stripped. Host-independent.
+// Backs Base.@cpu_uarch — see base/cpuid.jl.
+// Returns jl_nothing if cpu_name is not known to LLVM for the host arch.
+extern "C" JL_DLLEXPORT jl_value_t *jl_cpu_uarch_expand_features(const char *cpu_name)
+{
+    if (cpu_name == nullptr || *cpu_name == '\0')
+        return jl_nothing;
+    auto specs = tp::resolve_targets_for_llvm(cpu_name);
+    if (specs.empty() || (specs[0].flags & tp::TF_UNKNOWN_NAME))
+        return jl_nothing;
+    std::string names;
+    for (unsigned i = 0; i < num_features; i++) {
+        if (feature_test(&specs[0].en_features, feature_table[i].bit)) {
+            if (!names.empty())
+                names += ',';
+            names += feature_table[i].name;
+        }
+    }
+    return jl_pchar_to_string(names.data(), names.size());
 }
 
 extern "C" JL_DLLEXPORT void jl_cpufeatures_host(uint8_t *features_out, size_t bufsize)

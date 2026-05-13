@@ -178,6 +178,151 @@ const ISAs_by_family = Dict(
 # Test a CPU feature exists on the currently-running host
 test_cpu_feature(feature::UInt32) = ccall(:jl_test_cpu_feature, Bool, (UInt32,), feature)
 
+# Set of LLVM-canonical CPU feature names valid for the host architecture.
+# Used only for parse-time validation in @cpu_supports — the macro discards
+# the set after expansion so there is no runtime cost on the happy path.
+# psABI levels (x86-64-vN) and named CPU models go through @cpu_uarch.
+const _KNOWN_CPU_FEATURES = OncePerProcess{Set{Symbol}}() do
+    s = Set{Symbol}()
+    for (_, name) in _build_bit_to_name(string(Sys.ARCH))
+        push!(s, Symbol(name))
+    end
+    s
+end
+
+# Look up the JIT-ready feature set for a CPU name on the host arch.
+# Routes through jl_cpu_uarch_expand_features, which runs the same pipeline as
+# multiversioning's `resolve_targets_for_llvm`: hw-masked and with
+# non-deterministic features (rdrnd, rdseed, xsaveopt on x86) stripped, so
+# the returned set matches what a sysimg clone targeting this CPU would
+# actually have in its `target-features` attribute.
+# Returns a sorted Vector{Symbol} of LLVM feature names, or `nothing` if the
+# CPU name isn't known to LLVM for this architecture.
+function _lookup_cpu_features(name::String)
+    result = ccall(:jl_cpu_uarch_expand_features, Any, (Cstring,), name)
+    result === nothing && return nothing
+    feature_str = result::String
+    isempty(feature_str) && return Symbol[]
+    return sort!([Symbol(f) for f in split(feature_str, ',')])
+end
+
+@noinline _bad_feature_arg(x) =
+    error("@cpu_supports: expected literal feature names (Symbol or String), got $(repr(x))")
+
+# Parse a single macro argument as a feature Symbol.
+function _parse_feature_arg(feature)
+    if feature isa Symbol
+        return feature
+    elseif feature isa QuoteNode && feature.value isa Symbol
+        return feature.value
+    elseif feature isa AbstractString
+        return Symbol(feature)
+    else
+        _bad_feature_arg(feature)
+    end
+end
+
+"""
+    Base.@cpu_supports feat1 [feat2 ...] -> Bool
+
+Compile-time CPU feature query. Each `featN` must be a literal name
+(Symbol or String) of an LLVM target feature. Multiple features combine
+with logical AND: `@cpu_supports avx2 fma bmi2` is true iff *all* of them
+are supported by the enclosing function's effective subtarget.
+
+Mirrors GCC/Clang's `__builtin_cpu_supports`: each query is folded at
+compile time using the enclosing function's effective `target-features`
+and `target-cpu` attributes. Implications are honored — a function
+compiled with `+avx512f` answers `@cpu_supports fma` as `true`.
+
+Feature names must match LLVM's canonical spelling exactly. For names
+containing `-` or `.` (which can't appear in a Julia identifier), pass a
+String literal: `@cpu_supports "sse4.2"`, `@cpu_supports "amx-tile"`.
+
+Feature names are validated at macro-expansion time; unknown names error
+immediately.
+
+For "do I have at least this CPU's feature set?" queries (including
+x86-64 psABI levels like `x86-64-v3`), see [`Base.@cpu_uarch`](@ref).
+
+# Examples
+```julia
+if @cpu_supports avx2
+    # vectorize with 256-bit ops
+end
+
+if @cpu_supports avx2 fma bmi2 bmi
+    # require this exact combination
+end
+
+if @cpu_supports "sse4.2"
+    # hyphenated/dotted names need quoting
+end
+```
+"""
+macro cpu_supports(features...)
+    isempty(features) && error("@cpu_supports: at least one feature name required")
+    exprs = Expr[]
+    for feature in features
+        sym = _parse_feature_arg(feature)
+        sym in _KNOWN_CPU_FEATURES() || error(
+            "@cpu_supports: unknown CPU feature `$sym` for $(Sys.ARCH). ",
+            "Use `Base.CPUID.feature_names()` to list features known to LLVM ",
+            "for this architecture.")
+        push!(exprs, :(Core.Intrinsics.cpu_supports($(QuoteNode(sym)))))
+    end
+    return foldr((a, b) -> :($a & $b), exprs)
+end
+
+"""
+    Base.@cpu_uarch cpu -> Bool
+
+Expand `cpu` (an LLVM CPU model name like `haswell`, `znver4`,
+`x86-64-v3`, or `apple-m1`) into its JIT-ready feature set at
+macro-expansion time, then check that the enclosing function's effective
+subtarget supports all of them.
+
+Names containing `-` need to be quoted as strings or Symbols:
+`@cpu_uarch "apple-m1"` or `@cpu_uarch :apple_m1` (the latter via a
+Symbol literal isn't possible in Julia syntax, but a String literal
+works).
+
+Useful for "do I have at least this CPU's capabilities?" queries —
+including x86-64 psABI baselines (`x86-64-v2/v3/v4`). Implications and
+feature supersets are picked up automatically because each individual
+feature query is folded against the caller's subtarget.
+
+The CPU name is looked up against the host architecture's LLVM CPU table
+at macro-expansion time (via the same `resolve_targets_for_llvm` path
+multiversioning uses); unknown names error immediately.
+
+# Examples
+```julia
+if @cpu_uarch haswell
+    # any CPU with at least Haswell's JIT-relevant features
+end
+
+if @cpu_uarch "x86-64-v3"
+    # any CPU with at least the x86-64-v3 psABI baseline
+end
+
+if @cpu_uarch znver4
+    # any CPU with at least Zen4's features
+end
+```
+"""
+macro cpu_uarch(cpu)
+    sym = _parse_feature_arg(cpu)
+    features = _lookup_cpu_features(String(sym))
+    features === nothing && error(
+        "@cpu_uarch: unknown CPU model `$sym` for $(Sys.ARCH).")
+    isempty(features) && error(
+        "@cpu_uarch: CPU model `$sym` has no hw features in the database; ",
+        "this query would be vacuously true. Did you mean a more specific model?")
+    exprs = [:(Core.Intrinsics.cpu_supports($(QuoteNode(f)))) for f in features]
+    return foldr((a, b) -> :($a & $b), exprs)
+end
+
 # Normalize some variation in ARCH values (which typically come from `uname -m`)
 function normalize_arch(arch::String)
     arch = lowercase(arch)
